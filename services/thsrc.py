@@ -215,23 +215,37 @@ class THSRC(BaseService):
     def get_security_code(self, captcha_img_element):
         """OCR captcha using dual system (holey.cc + Gemini Vision)"""
         try:
-            # Get captcha image as base64 from Selenium
-            captcha_src = captcha_img_element.get_attribute('src')
+            # Method 1: Try to get image directly from Selenium screenshot (most reliable)
+            try:
+                image_data = captcha_img_element.screenshot_as_png
+                self.logger.info("Got captcha via Selenium screenshot")
+            except Exception as screenshot_err:
+                self.logger.warning(f"Screenshot failed: {screenshot_err}, trying src attribute...")
 
-            # If it's a data URL, extract the base64
-            if captcha_src.startswith('data:'):
-                base64_str = captcha_src.split(',')[1]
-                image_data = base64.b64decode(base64_str)
-            else:
-                # Download the image using httpx
-                with httpx.Client(timeout=60) as client:
-                    res = client.get(captcha_src)
-                    if res.status_code != 200:
-                        return None
-                    image_data = res.content
+                # Method 2: Fallback to src attribute
+                captcha_src = captcha_img_element.get_attribute('src')
 
-            # Use dual OCR system (holey.cc + Gemini Vision fallback)
-            security_code = self.captcha_ocr.recognize(image_data)
+                if captcha_src.startswith('data:'):
+                    # Data URL - extract base64 directly
+                    base64_str = captcha_src.split(',')[1]
+                    image_data = base64.b64decode(base64_str)
+                else:
+                    # External URL - use Selenium's execute_script to get image as base64
+                    # This uses the browser's session/cookies
+                    script = """
+                    var img = arguments[0];
+                    var canvas = document.createElement('canvas');
+                    canvas.width = img.naturalWidth;
+                    canvas.height = img.naturalHeight;
+                    var ctx = canvas.getContext('2d');
+                    ctx.drawImage(img, 0, 0);
+                    return canvas.toDataURL('image/png').split(',')[1];
+                    """
+                    base64_str = self.driver.execute_script(script, captcha_img_element)
+                    image_data = base64.b64decode(base64_str)
+
+            # Use dual OCR system (Gemini Vision first, holey.cc fallback)
+            security_code = self.captcha_ocr.recognize(image_data, use_gemini_first=True)
 
             if security_code:
                 self.logger.info("+ Security code: %s", security_code)
@@ -279,10 +293,35 @@ class THSRC(BaseService):
         """Click refresh captcha and get new captcha element"""
         self.logger.info("Updating captcha")
         try:
-            # Find and click the refresh captcha link
-            refresh_link = self.driver.find_element(By.CSS_SELECTOR, 'a[id*="reCodeLink"]')
-            refresh_link.click()
-            time.sleep(1)  # Wait for new captcha to load
+            # Try multiple selectors for the refresh captcha link
+            refresh_selectors = [
+                'a[id*="reCodeLink"]',
+                'a[id*="reCaptcha"]',
+                'a.captcha-refresh',
+                'a[onclick*="captcha"]',
+                '.captcha-box a',
+                'a[href*="captcha"]',
+            ]
+
+            refresh_link = None
+            for selector in refresh_selectors:
+                try:
+                    refresh_link = self.driver.find_element(By.CSS_SELECTOR, selector)
+                    if refresh_link:
+                        self.logger.info(f"Found refresh link with selector: {selector}")
+                        break
+                except:
+                    continue
+
+            if refresh_link:
+                self.driver.execute_script("arguments[0].click();", refresh_link)
+                time.sleep(1.5)  # Wait for new captcha to load
+            else:
+                # If no refresh link found, try clicking on the captcha image itself
+                self.logger.info("No refresh link found, trying to click captcha image...")
+                captcha_img = self.driver.find_element(By.CSS_SELECTOR, 'img.captcha-img')
+                self.driver.execute_script("arguments[0].click();", captcha_img)
+                time.sleep(1.5)
 
             # Get new captcha image
             captcha_img = self.driver.find_element(By.CSS_SELECTOR, 'img.captcha-img')
@@ -294,45 +333,74 @@ class THSRC(BaseService):
     def fill_booking_form(self, security_code):
         """Fill the booking form using Selenium"""
         try:
+            self.logger.info("Filling booking form...")
+
+            # First, dismiss any overlay/popup that might block interactions
+            # THSRC website has a "mTop" div that can intercept clicks
+            self._dismiss_overlays()
+
+            # Scroll to the form area to ensure visibility
+            try:
+                form_element = self.driver.find_element(By.CSS_SELECTOR, 'form')
+                self.driver.execute_script("arguments[0].scrollIntoView({block: 'start'});", form_element)
+                time.sleep(0.3)
+            except Exception as scroll_err:
+                self.logger.warning(f"Could not scroll to form: {scroll_err}")
+
             # Select booking method (time search or train number search)
+            # Local version uses: radio31 (time search), radio33 (train number search)
+            self.logger.info("Selecting booking method...")
             if self.fields['train-no']:
-                # Train number search
-                train_no_radio = self.driver.find_element(By.ID, 'bookingMethod2')
-                train_no_radio.click()
+                # Train number search - find radio by value 'radio33'
+                train_no_radio = self.driver.find_element(By.CSS_SELECTOR, 'input[name="bookingMethod"][value="radio33"]')
+                self.driver.execute_script("arguments[0].click();", train_no_radio)
                 train_no_input = self.driver.find_element(By.NAME, 'toTrainIDInputField')
                 train_no_input.clear()
                 train_no_input.send_keys(self.fields['train-no'].strip())
             else:
-                # Time search (default)
-                time_radio = self.driver.find_element(By.ID, 'bookingMethod1')
-                time_radio.click()
+                # Time search (default) - find radio by value 'radio31'
+                time_radio = self.driver.find_element(By.CSS_SELECTOR, 'input[name="bookingMethod"][value="radio31"]')
+                self.driver.execute_script("arguments[0].click();", time_radio)
 
-            # Select start station
-            start_station_select = Select(self.driver.find_element(By.NAME, 'selectStartStation'))
-            start_station_select.select_by_value(str(self.start_station))
+            # Select start station (use JavaScript to set value directly)
+            self.logger.info(f"Setting start station: {self.start_station}")
+            start_station_select = self.driver.find_element(By.NAME, 'selectStartStation')
+            self.driver.execute_script(
+                "arguments[0].value = arguments[1]; arguments[0].dispatchEvent(new Event('change'));",
+                start_station_select, str(self.start_station)
+            )
 
             # Select destination station
-            dest_station_select = Select(self.driver.find_element(By.NAME, 'selectDestinationStation'))
-            dest_station_select.select_by_value(str(self.dest_station))
+            self.logger.info(f"Setting destination station: {self.dest_station}")
+            dest_station_select = self.driver.find_element(By.NAME, 'selectDestinationStation')
+            self.driver.execute_script(
+                "arguments[0].value = arguments[1]; arguments[0].dispatchEvent(new Event('change'));",
+                dest_station_select, str(self.dest_station)
+            )
 
             # Set outbound date
+            self.logger.info(f"Setting outbound date: {self.outbound_date}")
             date_input = self.driver.find_element(By.NAME, 'toTimeInputField')
             self.driver.execute_script("arguments[0].value = arguments[1]", date_input, self.outbound_date)
 
             # Select outbound time (if not using train number)
             if not self.fields['train-no']:
-                time_select = Select(self.driver.find_element(By.NAME, 'toTimeTable'))
-                time_select.select_by_value(self.outbound_time)
+                self.logger.info(f"Setting outbound time: {self.outbound_time}")
+                time_select = self.driver.find_element(By.NAME, 'toTimeTable')
+                self.driver.execute_script(
+                    "arguments[0].value = arguments[1]; arguments[0].dispatchEvent(new Event('change'));",
+                    time_select, self.outbound_time
+                )
 
-            # Select car type
+            # Select car type (use JavaScript click)
             car_type_radios = self.driver.find_elements(By.NAME, 'trainCon:trainRadioGroup')
             if len(car_type_radios) > self.car_type:
-                car_type_radios[self.car_type].click()
+                self.driver.execute_script("arguments[0].click();", car_type_radios[self.car_type])
 
-            # Select preferred seat
+            # Select preferred seat (use JavaScript click)
             seat_radios = self.driver.find_elements(By.NAME, 'seatCon:seatRadioGroup')
             if len(seat_radios) > self.preferred_seat:
-                seat_radios[self.preferred_seat].click()
+                self.driver.execute_script("arguments[0].click();", seat_radios[self.preferred_seat])
 
             # Set ticket quantities
             ticket_selects = [
@@ -346,28 +414,81 @@ class THSRC(BaseService):
 
             for select_name, value in ticket_selects:
                 try:
-                    ticket_select = Select(self.driver.find_element(By.NAME, select_name))
-                    ticket_select.select_by_value(value)
+                    ticket_select = self.driver.find_element(By.NAME, select_name)
+                    self.driver.execute_script(
+                        "arguments[0].value = arguments[1]; arguments[0].dispatchEvent(new Event('change'));",
+                        ticket_select, value
+                    )
                 except NoSuchElementException:
                     pass  # Some ticket types may not exist
 
             # Enter security code
+            self.logger.info("Entering security code...")
             security_input = self.driver.find_element(By.NAME, 'homeCaptcha:securityCode')
             security_input.clear()
             security_input.send_keys(security_code)
 
-            # Click submit button
+            # Click submit button using JavaScript
+            self.logger.info("Clicking submit button...")
             submit_btn = self.driver.find_element(By.NAME, 'SubmitButton')
-            submit_btn.click()
+            self.driver.execute_script("arguments[0].click();", submit_btn)
 
             # Wait for page to load
+            self.logger.info("Waiting for response...")
             time.sleep(2)
 
+            self.logger.info("Form submitted successfully")
             return True
 
         except Exception as e:
             self.logger.error(f"Failed to fill booking form: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
             return False
+
+    def _dismiss_overlays(self):
+        """Dismiss any overlay/popup elements that might block interactions"""
+        try:
+            # Hide or remove common overlay elements
+            overlay_selectors = [
+                '.mTop',           # THSRC top banner
+                '.cookie-banner',  # Cookie consent
+                '.modal-backdrop', # Bootstrap modal
+                '.overlay',        # Generic overlay
+                '#mask',           # Common mask element
+            ]
+
+            for selector in overlay_selectors:
+                try:
+                    elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    for el in elements:
+                        # Try to hide the overlay using JavaScript
+                        self.driver.execute_script(
+                            "arguments[0].style.display = 'none'; arguments[0].style.visibility = 'hidden';",
+                            el
+                        )
+                        self.logger.info(f"Dismissed overlay: {selector}")
+                except:
+                    pass
+
+            # Also try to click any close buttons
+            close_selectors = [
+                '.close', '.btn-close', '[aria-label="Close"]',
+                '.modal-close', '.dismiss', '.cookie-close'
+            ]
+
+            for selector in close_selectors:
+                try:
+                    close_btn = self.driver.find_element(By.CSS_SELECTOR, selector)
+                    if close_btn.is_displayed():
+                        self.driver.execute_script("arguments[0].click();", close_btn)
+                        self.logger.info(f"Clicked close button: {selector}")
+                        time.sleep(0.3)
+                except:
+                    pass
+
+        except Exception as e:
+            self.logger.debug(f"Error dismissing overlays: {e}")
 
     def check_booking_result(self):
         """Check if booking form submission was successful"""

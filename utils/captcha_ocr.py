@@ -18,7 +18,7 @@ class CaptchaOCR:
     """
 
     def __init__(self, holey_api_url: str = None):
-        self.holey_api_url = holey_api_url or "https://holey.cc/api/ocr"
+        self.holey_api_url = holey_api_url or "https://ocr.holey.cc/thsrc"
         self.gemini_api_key = os.environ.get('GEMINI_API_KEY')
         self.gemini_model = None
 
@@ -80,7 +80,7 @@ class CaptchaOCR:
             base64_str = base64.b64encode(image_data).decode("utf-8")
             base64_url_safe = base64_str.replace('+', '-').replace('/', '_').replace('=', '')
 
-            with httpx.Client(timeout=30) as client:
+            with httpx.Client(timeout=10) as client:  # Reduced timeout for faster fallback
                 res = client.post(
                     self.holey_api_url,
                     json={'base64_str': base64_url_safe}
