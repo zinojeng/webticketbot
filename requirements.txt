@@ -1,0 +1,23 @@
+# Core dependencies
+lxml
+beautifulsoup4
+orjson
+rtoml
+validators
+pyperclip
+
+# HTTP client (for OCR API calls)
+httpx
+
+# Selenium for browser automation
+selenium>=4.15.0
+webdriver-manager>=4.0.0
+
+# Web framework
+flask>=3.0.0
+
+# Environment variables
+python-dotenv
+
+# Google Gemini AI for captcha OCR
+google-generativeai>=0.8.0
